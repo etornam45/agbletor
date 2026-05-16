@@ -4,6 +4,7 @@ import mlx.core as mx
 
 import mlx.optimizers as optim
 from dinov3.models import vit_small
+from dinov3.checkpoints.quantize import quantize_model
 from heads.detr.transformer import DETR
 from heads.detr.dataset import make_stream
 from heads.detr.matcher import HungarianLoss
@@ -18,7 +19,11 @@ dset, dset_ln = make_stream(
     batch_size=32,
     shuffle=True,
 )
+print("Total dataset length:", dset_ln)
 
+BACKBONE_WEIGHTS = "dinov3/checkpoints/model/vit-small.safetensors"
+QUANT_BITS = 4
+QUANT_GROUP_SIZE = 64
 
 dinov3_small = vit_small(
     patch_size=16,
@@ -26,7 +31,15 @@ dinov3_small = vit_small(
     layerscale_init=1e-5,
     mask_k_bias=True,
 )
-dinov3_small.load_weights("dinov3/checkpoints/model/vit-small.safetensors")
+dinov3_small.load_weights(BACKBONE_WEIGHTS)
+quantize_model(
+    dinov3_small,
+    bits=QUANT_BITS,
+    group_size=QUANT_GROUP_SIZE,
+    mode="affine",
+    quantize_input=False,
+    skip_masked_qkv=True,
+)
 dinov3_small.freeze()
 total = sum(p.size for _, p in nn.utils.tree_flatten(dinov3_small.parameters()))
 print(f"Total parameters: {total / 1e6:.1f}M")
@@ -37,8 +50,16 @@ detr_decoder = build_detr(
     n_classes=92,
     n_points=4,
 )
-out_path = "dinov3/checkpoints/model/detr_decoder.safetensors"
-detr_decoder.load_weights(out_path)
+quantize_model(
+    detr_decoder,
+    bits=QUANT_BITS,
+    group_size=QUANT_GROUP_SIZE,
+    mode="affine",
+    quantize_input=False,
+    skip_masked_qkv=True,
+)
+out_path = "dinov3/checkpoints/model/detr_decoder_q4.safetensors"
+# detr_decoder.load_weights(out_path)
 
 
 total = sum(p.size for _, p in nn.utils.tree_flatten(detr_decoder.parameters()))
