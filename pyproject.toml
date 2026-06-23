@@ -1,12 +1,18 @@
 [project]
 name = "dinov3"
 version = "0.1.0"
-description = "Add your description here"
+description = "PyTorch DINOv3 with DETR detection head"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-	"mlx",
-	"torch",
-	"transformers",
-	"matplotlib"
+    "torch",
+    "transformers",
+    "matplotlib",
+    "numpy",
+    "pillow",
+    "scipy",
+    "pycocotools",
+    "tqdm",
+    "pyyaml",
+    "safetensors",
 ]

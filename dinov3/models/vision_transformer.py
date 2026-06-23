@@ -1,19 +1,17 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This software may be used and distributed in accordance with
+# the terms of the DINOv3 License Agreement.
+
 import logging
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
-import mlx.core as mx
-import mlx.nn as nn
+import torch
+import torch.nn.init
+from torch import Tensor, nn
 
-from dinov3.layers import (
-    LayerScale,
-    Mlp,
-    PatchEmbed,
-    RMSNorm,
-    RopePositionEmbedding,
-    SelfAttentionBlock,
-    SwiGLUFFN,
-)
+from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
 from dinov3.utils import named_apply
 
 logger = logging.getLogger("dinov3")
@@ -27,50 +25,35 @@ ffn_layer_dict = {
 }
 
 norm_layer_dict = {
-    "layernorm": partial(nn.LayerNorm, eps=1e-5),
+    "layernorm": partial(nn.LayerNorm, eps=1e-6),
     "layernormbf16": partial(nn.LayerNorm, eps=1e-5),
     "rmsnorm": RMSNorm,
 }
 
-# Map string names to MLX dtypes.
-dtype_dict: Dict[str, mx.Dtype] = {
-    "fp32": mx.float32,
-    "fp16": mx.float16,
-    "bf16": mx.bfloat16,
+dtype_dict = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
 }
 
 
 def init_weights_vit(module: nn.Module, name: str = ""):
-    """
-    Initialization helper adapted for MLX modules.
-    """
     if isinstance(module, nn.Linear):
-        # Truncated normal is approximated with a plain normal here.
-        std = 0.02
-        module.weight = mx.random.normal(
-            shape=module.weight.shape,
-            dtype=module.weight.dtype,
-            loc=0.0,
-            scale=std,
-        )
-        if "bias" in module:
-            module.bias = mx.zeros_like(module.bias)
-
+        torch.nn.init.trunc_normal_(module.weight, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+        if hasattr(module, "bias_mask") and module.bias_mask is not None:
+            o = module.out_features
+            module.bias_mask.fill_(1)
+            module.bias_mask[o // 3 : 2 * o // 3].fill_(0)
     if isinstance(module, nn.LayerNorm):
-        # MLX LayerNorm exposes reset_parameters
-        if hasattr(module, "reset_parameters"):
-            module.reset_parameters()
-
+        module.reset_parameters()
     if isinstance(module, LayerScale):
         module.reset_parameters()
-
     if isinstance(module, PatchEmbed):
         module.reset_parameters()
-
     if isinstance(module, RMSNorm):
-        # For RMSNorm we simply reset the scale to ones.
-        if hasattr(module, "reset_parameters"):
-            module.reset_parameters()
+        module.reset_parameters()
 
 
 class DinoVisionTransformer(nn.Module):
@@ -113,9 +96,7 @@ class DinoVisionTransformer(nn.Module):
 
         norm_layer_cls = norm_layer_dict[norm_layer]
 
-        self.num_features = self.embed_dim = (
-            embed_dim  # num_features for consistency with other models
-        )
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.n_blocks = depth
         self.num_heads = num_heads
         self.patch_size = patch_size
@@ -128,23 +109,16 @@ class DinoVisionTransformer(nn.Module):
             flatten_embedding=False,
         )
 
-        # CLS, storage, and mask tokens are plain MLX arrays treated as parameters.
-        self.cls_token = mx.zeros((1, 1, embed_dim), dtype=mx.float32)
+        self.cls_token = nn.Parameter(torch.empty(1, 1, embed_dim, device=device))
         self.n_storage_tokens = n_storage_tokens
         if self.n_storage_tokens > 0:
-            self.storage_tokens = mx.zeros(
-                (1, n_storage_tokens, embed_dim), dtype=mx.float32
-            )
+            self.storage_tokens = nn.Parameter(torch.empty(1, n_storage_tokens, embed_dim, device=device))
         logger.info(f"using base={pos_embed_rope_base} for rope new")
         logger.info(f"using min_period={pos_embed_rope_min_period} for rope new")
         logger.info(f"using max_period={pos_embed_rope_max_period} for rope new")
-        logger.info(
-            f"using normalize_coords={pos_embed_rope_normalize_coords} for rope new"
-        )
+        logger.info(f"using normalize_coords={pos_embed_rope_normalize_coords} for rope new")
         logger.info(f"using shift_coords={pos_embed_rope_shift_coords} for rope new")
-        logger.info(
-            f"using rescale_coords={pos_embed_rope_rescale_coords} for rope new"
-        )
+        logger.info(f"using rescale_coords={pos_embed_rope_rescale_coords} for rope new")
         logger.info(f"using jitter_coords={pos_embed_rope_jitter_coords} for rope new")
         logger.info(f"using dtype={pos_embed_rope_dtype} for rope new")
         self.rope_embed = RopePositionEmbedding(
@@ -158,6 +132,7 @@ class DinoVisionTransformer(nn.Module):
             jitter_coords=pos_embed_rope_jitter_coords,
             rescale_coords=pos_embed_rope_rescale_coords,
             dtype=dtype_dict[pos_embed_rope_dtype],
+            device=device,
         )
         logger.info(f"using {ffn_layer} layer as FFN")
         ffn_layer_cls = ffn_layer_dict[ffn_layer]
@@ -170,18 +145,19 @@ class DinoVisionTransformer(nn.Module):
                 qkv_bias=qkv_bias,
                 proj_bias=proj_bias,
                 ffn_bias=ffn_bias,
-                drop=drop_path_rate,
+                drop_path=drop_path_rate,
                 norm_layer=norm_layer_cls,
                 act_layer=nn.GELU,
                 ffn_layer=ffn_layer_cls,
                 init_values=layerscale_init,
                 mask_k_bias=mask_k_bias,
+                device=device,
             )
             for i in range(depth)
         ]
 
         self.chunked_blocks = False
-        self.blocks = blocks_list
+        self.blocks = nn.ModuleList(blocks_list)
 
         # This norm is applied to everything, or when untying, to patch and mask tokens.
         self.norm = norm_layer_cls(embed_dim)
@@ -201,72 +177,49 @@ class DinoVisionTransformer(nn.Module):
         else:
             self.local_cls_norm = None
         self.head = nn.Identity()
-        self.mask_token = mx.zeros((1, embed_dim), dtype=mx.float32)
+        self.mask_token = nn.Parameter(torch.empty(1, embed_dim, device=device))
 
     def init_weights(self):
-        # Reinitialize RoPE periods and token parameters.
         self.rope_embed._init_weights()
-
-        std = 0.02
-        self.cls_token = mx.random.normal(
-            shape=self.cls_token.shape,
-            dtype=self.cls_token.dtype,
-            loc=0.0,
-            scale=std,
-        )
-        if self.n_storage_tokens > 0 and self.storage_tokens is not None:
-            self.storage_tokens = mx.random.normal(
-                shape=self.storage_tokens.shape,
-                dtype=self.storage_tokens.dtype,
-                loc=0.0,
-                scale=std,
-            )
-        self.mask_token = mx.zeros_like(self.mask_token)
-
+        nn.init.normal_(self.cls_token, std=0.02)
+        if self.n_storage_tokens > 0:
+            nn.init.normal_(self.storage_tokens, std=0.02)
+        nn.init.zeros_(self.mask_token)
         named_apply(init_weights_vit, self)
 
-    def prepare_tokens_with_masks(
-        self, x: mx.array, masks: Optional[mx.array] = None
-    ) -> Tuple[mx.array, Tuple[int, int]]:
-        x = self.patch_embed(x)  # [B, H, W, D]
-        B, H, W, D = x.shape
-        x = x.reshape(B, H * W, D)  # [B, HW, D]
+    def prepare_tokens_with_masks(self, x: Tensor, masks=None) -> Tuple[Tensor, Tuple[int]]:
+        x = self.patch_embed(x)
+        B, H, W, _ = x.shape
+        x = x.flatten(1, 2)
 
         if masks is not None:
-            # masks: [B, HW] -> [B, HW, 1]
-            cond = mx.expand_dims(masks.astype(bool), axis=-1)
-            mask_token = self.mask_token.astype(x.dtype)  # [1, D]
-            mask_token = mx.expand_dims(mask_token, axis=0)  # [1, 1, D]
-            x = mx.where(cond, mask_token, x)
+            x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
             cls_token = self.cls_token
         else:
-            cls_token = self.cls_token
-
-        if self.n_storage_tokens > 0 and self.storage_tokens is not None:
+            cls_token = self.cls_token + 0 * self.mask_token
+        if self.n_storage_tokens > 0:
             storage_tokens = self.storage_tokens
         else:
-            storage_tokens = mx.zeros(
-                (1, 0, cls_token.shape[-1]), dtype=cls_token.dtype
+            storage_tokens = torch.empty(
+                1,
+                0,
+                cls_token.shape[-1],
+                dtype=cls_token.dtype,
+                device=cls_token.device,
             )
 
-        # Expand CLS and storage tokens across the batch and concatenate.
-        cls_tokens = mx.repeat(cls_token, repeats=B, axis=0)
-        storage_tokens_exp = mx.repeat(storage_tokens, repeats=B, axis=0)
-
-        x = mx.concat(
+        x = torch.cat(
             [
-                cls_tokens,
-                storage_tokens_exp,
+                cls_token.expand(B, -1, -1),
+                storage_tokens.expand(B, -1, -1),
                 x,
             ],
-            axis=1,
+            dim=1,
         )
 
         return x, (H, W)
 
-    def forward_features_list(
-        self, x_list: List[mx.array], masks_list: List[Optional[mx.array]]
-    ) -> List[Dict[str, mx.array]]:
+    def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
         x = []
         rope = []
         for t_x, t_masks in zip(x_list, masks_list):
@@ -280,24 +233,20 @@ class DinoVisionTransformer(nn.Module):
                 rope_sincos = [None for r in rope]
             x = blk(x, rope_sincos)
         all_x = x
-        output: List[Dict[str, mx.array]] = []
-        for idx, (x_val, masks) in enumerate(zip(all_x, masks_list)):
+        output = []
+        for idx, (x, masks) in enumerate(zip(all_x, masks_list)):
             if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:
                 if self.untie_global_and_local_cls_norm and self.training and idx == 1:
                     # Assume second entry of list corresponds to local crops.
                     # We only ever apply this during training.
-                    x_norm_cls_reg = self.local_cls_norm(
-                        x_val[:, : self.n_storage_tokens + 1]
-                    )
+                    x_norm_cls_reg = self.local_cls_norm(x[:, : self.n_storage_tokens + 1])
                 elif self.untie_cls_and_patch_norms:
-                    x_norm_cls_reg = self.cls_norm(
-                        x_val[:, : self.n_storage_tokens + 1]
-                    )
+                    x_norm_cls_reg = self.cls_norm(x[:, : self.n_storage_tokens + 1])
                 else:
-                    x_norm_cls_reg = self.norm(x_val[:, : self.n_storage_tokens + 1])
-                x_norm_patch = self.norm(x_val[:, self.n_storage_tokens + 1 :])
+                    x_norm_cls_reg = self.norm(x[:, : self.n_storage_tokens + 1])
+                x_norm_patch = self.norm(x[:, self.n_storage_tokens + 1 :])
             else:
-                x_norm = self.norm(x_val)
+                x_norm = self.norm(x)
                 x_norm_cls_reg = x_norm[:, : self.n_storage_tokens + 1]
                 x_norm_patch = x_norm[:, self.n_storage_tokens + 1 :]
             output.append(
@@ -305,33 +254,23 @@ class DinoVisionTransformer(nn.Module):
                     "x_norm_clstoken": x_norm_cls_reg[:, 0],
                     "x_storage_tokens": x_norm_cls_reg[:, 1:],
                     "x_norm_patchtokens": x_norm_patch,
-                    "x_prenorm": x_val,
+                    "x_prenorm": x,
                     "masks": masks,
                 }
             )
         return output
 
-    def forward_features(
-        self,
-        x: mx.array | List[mx.array],
-        masks: Optional[mx.array | List[Optional[mx.array]]] = None,
-    ) -> Union[Dict[str, mx.array], List[Dict[str, mx.array]]]:
-        if isinstance(x, mx.array):
+    def forward_features(self, x: Tensor | List[Tensor], masks: Optional[Tensor] = None) -> List[Dict[str, Tensor]]:
+        if isinstance(x, torch.Tensor):
             return self.forward_features_list([x], [masks])[0]
         else:
-            if masks is None:
-                masks = [None] * len(x)
             return self.forward_features_list(x, masks)
 
-    def _get_intermediate_layers_not_chunked(
-        self, x: mx.array, n: int = 1
-    ) -> List[mx.array]:
+    def _get_intermediate_layers_not_chunked(self, x: Tensor, n: int = 1) -> List[Tensor]:
         x, (H, W) = self.prepare_tokens_with_masks(x)
         # If n is an int, take the n last blocks. If it's a list, take them
         output, total_block_len = [], len(self.blocks)
-        blocks_to_take = (
-            range(total_block_len - n, total_block_len) if isinstance(n, int) else n
-        )
+        blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         for i, blk in enumerate(self.blocks):
             if self.rope_embed is not None:
                 rope_sincos = self.rope_embed(H=H, W=W)
@@ -340,21 +279,19 @@ class DinoVisionTransformer(nn.Module):
             x = blk(x, rope_sincos)
             if i in blocks_to_take:
                 output.append(x)
-        assert len(output) == len(blocks_to_take), (
-            f"only {len(output)} / {len(blocks_to_take)} blocks found"
-        )
+        assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
         return output
 
     def get_intermediate_layers(
         self,
-        x: mx.array,
+        x: torch.Tensor,
         *,
         n: Union[int, Sequence] = 1,  # Layers or n last layers to take
         reshape: bool = False,
         return_class_token: bool = False,
         return_extra_tokens: bool = False,
         norm: bool = True,
-    ) -> Tuple[Union[mx.array, Tuple[mx.array, ...]]]:
+    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, ...]]]:
         outputs = self._get_intermediate_layers_not_chunked(x, n)
         if norm:
             outputs_normed = []
@@ -362,9 +299,7 @@ class DinoVisionTransformer(nn.Module):
                 if self.untie_cls_and_patch_norms:
                     x_norm_cls_reg = self.cls_norm(out[:, : self.n_storage_tokens + 1])
                     x_norm_patch = self.norm(out[:, self.n_storage_tokens + 1 :])
-                    outputs_normed.append(
-                        mx.concat((x_norm_cls_reg, x_norm_patch), axis=1)
-                    )
+                    outputs_normed.append(torch.cat((x_norm_cls_reg, x_norm_patch), dim=1))
                 else:
                     outputs_normed.append(self.norm(out))
             outputs = outputs_normed
@@ -374,10 +309,7 @@ class DinoVisionTransformer(nn.Module):
         if reshape:
             B, _, h, w = x.shape
             outputs = [
-                mx.transpose(
-                    out.reshape(B, h // self.patch_size, w // self.patch_size, -1),
-                    (0, 3, 1, 2),
-                )
+                out.reshape(B, h // self.patch_size, w // self.patch_size, -1).permute(0, 3, 1, 2).contiguous()
                 for out in outputs
             ]
         if not return_class_token and not return_extra_tokens:
@@ -389,9 +321,7 @@ class DinoVisionTransformer(nn.Module):
         elif return_class_token and return_extra_tokens:
             return tuple(zip(outputs, class_tokens, extra_tokens))
 
-    def __call__(
-        self, *args, is_training: bool = False, **kwargs
-    ) -> Union[List[Dict[str, mx.array]], mx.array]:
+    def forward(self, *args, is_training: bool = False, **kwargs) -> List[Dict[str, Tensor]] | Tensor:
         ret = self.forward_features(*args, **kwargs)
         if is_training:
             return ret
@@ -399,67 +329,67 @@ class DinoVisionTransformer(nn.Module):
             return self.head(ret["x_norm_clstoken"])
 
 
-def vit_small(patch_size=16, ffn_ratio=4, **kwargs):
+def vit_small(patch_size=16, **kwargs):
     model = DinoVisionTransformer(
         patch_size=patch_size,
         embed_dim=384,
         depth=12,
         num_heads=6,
-        ffn_ratio=ffn_ratio,
+        ffn_ratio=4,
         **kwargs,
     )
     return model
 
 
-def vit_base(patch_size=16, ffn_ratio=4, **kwargs):
+def vit_base(patch_size=16, **kwargs):
     model = DinoVisionTransformer(
         patch_size=patch_size,
         embed_dim=768,
         depth=12,
         num_heads=12,
-        ffn_ratio=ffn_ratio,
+        ffn_ratio=4,
         **kwargs,
     )
     return model
 
 
-def vit_large(patch_size=16, ffn_ratio=4, **kwargs):
+def vit_large(patch_size=16, **kwargs):
     model = DinoVisionTransformer(
         patch_size=patch_size,
         embed_dim=1024,
         depth=24,
         num_heads=16,
-        ffn_ratio=ffn_ratio,
+        ffn_ratio=4,
         **kwargs,
     )
     return model
 
 
-def vit_so400m(patch_size=16, ffn_ratio=3.777777778, **kwargs):
+def vit_so400m(patch_size=16, **kwargs):
     model = DinoVisionTransformer(
         patch_size=patch_size,
         embed_dim=1152,
         depth=27,
         num_heads=18,
-        ffn_ratio=ffn_ratio,
+        ffn_ratio=3.777777778,
         **kwargs,
     )
     return model
 
 
-def vit_huge2(patch_size=16, ffn_ratio=4, **kwargs):
+def vit_huge2(patch_size=16, **kwargs):
     model = DinoVisionTransformer(
         patch_size=patch_size,
         embed_dim=1280,
         depth=32,
         num_heads=20,
-        ffn_ratio=ffn_ratio,
+        ffn_ratio=4,
         **kwargs,
     )
     return model
 
 
-def vit_giant2(patch_size=16, ffn_ratio=4, **kwargs):
+def vit_giant2(patch_size=16, **kwargs):
     """
     Close to ViT-giant, with embed-dim 1536 and 24 heads => embed-dim per head 64
     """
@@ -468,27 +398,19 @@ def vit_giant2(patch_size=16, ffn_ratio=4, **kwargs):
         embed_dim=1536,
         depth=40,
         num_heads=24,
-        ffn_ratio=ffn_ratio,
+        ffn_ratio=4,
         **kwargs,
     )
     return model
 
 
-def vit_7b(patch_size=16, ffn_ratio=3, **kwargs):
+def vit_7b(patch_size=16, **kwargs):
     model = DinoVisionTransformer(
         patch_size=patch_size,
         embed_dim=4096,
         depth=40,
         num_heads=32,
-        ffn_ratio=ffn_ratio,
+        ffn_ratio=3,
         **kwargs,
     )
     return model
-
-
-if __name__ == "__main__":
-    model = vit_small(patch_size=16)
-    model.init_weights()
-    x = mx.random.uniform(shape=(1, 3, 224, 224))
-    print(model(x, is_training=True))
-    print(model)

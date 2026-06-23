@@ -1,15 +1,19 @@
 import yaml
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
+import torch
+
 from dinov3.models import (
-    vit_small,
-    vit_base,
-    vit_large,
-    vit_so400m,
-    vit_huge2,
-    vit_giant2,
     vit_7b,
+    vit_base,
+    vit_giant2,
+    vit_huge2,
+    vit_large,
+    vit_small,
+    vit_so400m,
 )
+from dinov3.utils.device import get_device
 
 
 @dataclass
@@ -30,10 +34,9 @@ class DinoConfig:
         return cls(**data)
 
     def to_dict(self) -> Dict[str, Any]:
-        # Filter out model_type as it's not a parameter of the ViT models themselves
         return {k: v for k, v in self.__dict__.items() if k != "model_type"}
 
-    def build_model(self):
+    def build_model(self, device: Optional[torch.device] = None) -> torch.nn.Module:
         model_fns = {
             "vit_small": vit_small,
             "vit_base": vit_base,
@@ -48,4 +51,7 @@ class DinoConfig:
             raise ValueError(f"Unknown model type: {self.model_type}")
 
         kwargs = self.to_dict()
-        return model_fns[self.model_type](**kwargs)
+        model = model_fns[self.model_type](**kwargs)
+        if device is None:
+            device = get_device()
+        return model.to(device)

@@ -1,21 +1,24 @@
-import mlx.core as mx
-import mlx.nn as nn
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This software may be used and distributed in accordance with
+# the terms of the DINOv3 License Agreement.
+
+import torch
+from torch import Tensor, nn
 
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-        self.weight = mx.ones(shape=(dim,))
+        self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-    def __call__(self, x: mx.array) -> mx.array:
-        return x * mx.rsqrt(mx.square(x).mean(axis=-1, keepdims=True) + self.eps) * self.weight
+    def reset_parameters(self) -> None:
+        nn.init.constant_(self.weight, 1)
 
-    def reset_parameters(self):
-        self.weight = mx.ones_like(self.weight)
+    def _norm(self, x: Tensor) -> Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-
-if __name__ == "__main__":
-	rms_norm = RMSNorm(dim=1024)
-	x = mx.random.uniform(shape=(1, 50000, 1024))
-	print(rms_norm(x).shape)
+    def forward(self, x: Tensor) -> Tensor:
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight

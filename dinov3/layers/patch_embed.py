@@ -1,8 +1,12 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This software may be used and distributed in accordance with
+# the terms of the DINOv3 License Agreement.
+
 import math
 from typing import Callable, Tuple, Union
 
-import mlx.core as mx
-import mlx.nn as nn
+from torch import Tensor, nn
 
 
 def make_2tuple(x):
@@ -54,73 +58,32 @@ class PatchEmbed(nn.Module):
 
         self.flatten_embedding = flatten_embedding
 
-        # MLX Conv2d expects inputs in NHWC and weights in OHWI.
-        self.proj = nn.Conv2d(
-            in_chans,
-            embed_dim,
-            kernel_size=patch_HW,
-            stride=patch_HW,
-            bias=True,
-        )
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_HW, stride=patch_HW)
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
-    def __call__(self, x: mx.array) -> mx.array:
-        # Input is expected to be NHWC (B, H, W, C)
-        # However, for compatibility with typical PT style calling code,
-        # we check if it looks like NCHW and transpose if needed.
-        # But per standard MLX, we should prefer NHWC.
-        if x.ndim == 4 and x.shape[1] == self.in_chans and x.shape[-1] != self.in_chans:
-            x = x.transpose(0, 2, 3, 1)
+    def forward(self, x: Tensor) -> Tensor:
+        _, _, H, W = x.shape
+        # patch_H, patch_W = self.patch_size
+        # assert H % patch_H == 0, f"Input image height {H} is not a multiple of patch height {patch_H}"
+        # assert W % patch_W == 0, f"Input image width {W} is not a multiple of patch width: {patch_W}"
 
-        B, H, W, C = x.shape
-
-        # Convolution in NHWC
-        x = self.proj(x)  # (B, H_out, W_out, embed_dim)
-        B, H_out, W_out, C_out = x.shape
-
-        # Flatten to (B, N, D) where N = H_out * W_out
-        x = x.reshape(B, H_out * W_out, C_out)
+        x = self.proj(x)  # B C H W
+        H, W = x.size(2), x.size(3)
+        x = x.flatten(2).transpose(1, 2)  # B HW C
         x = self.norm(x)
-
         if not self.flatten_embedding:
-            # Return spatial map (B, H_out, W_out, D) in NHWC.
-            x = x.reshape(B, H_out, W_out, self.embed_dim)
-
+            x = x.reshape(-1, H, W, self.embed_dim)  # B H W C
         return x
 
     def flops(self) -> float:
         Ho, Wo = self.patches_resolution
-        flops = (
-            Ho
-            * Wo
-            * self.embed_dim
-            * self.in_chans
-            * (self.patch_size[0] * self.patch_size[1])
-        )
+        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops
 
     def reset_parameters(self):
-        # Reinitialize weights using Conv2d's initialization logic or custom
-        fan_in = self.in_chans * self.patch_size[0] * self.patch_size[1]
-        std = 1.0 / math.sqrt(fan_in)
-        self.proj.weight = mx.random.uniform(
-            low=-std,
-            high=std,
-            shape=self.proj.weight.shape,
-            dtype=self.proj.weight.dtype,
-        )
-        if "bias" in self.proj:
-            self.proj.bias = mx.random.uniform(
-                low=-std,
-                high=std,
-                shape=self.proj.bias.shape,
-                dtype=self.proj.bias.dtype,
-            )
-
-
-if __name__ == "__main__":
-    patch_embed = PatchEmbed(img_size=224, patch_size=16, in_chans=3, embed_dim=768)
-    x = mx.random.uniform(shape=(1, 3, 224, 224))
-    print(patch_embed(x).shape)
+        k = 1 / (self.in_chans * (self.patch_size[0] ** 2))
+        nn.init.uniform_(self.proj.weight, -math.sqrt(k), math.sqrt(k))
+        if self.proj.bias is not None:
+            nn.init.uniform_(self.proj.bias, -math.sqrt(k), math.sqrt(k))

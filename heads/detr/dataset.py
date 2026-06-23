@@ -1,7 +1,8 @@
 import numpy as np
+import torch
 from PIL import Image
 from pycocotools.coco import COCO
-import mlx.data as dx
+from torch.utils.data import DataLoader, Dataset
 
 
 def letterbox(image, target_size):
@@ -32,11 +33,6 @@ def transform_boxes(boxes, scale, pad_x, pad_y, target_size):
 
 
 def load_coco(img_dir, ann_file, img_size=640):
-    """
-    Returns a list of lightweight dicts — NO images loaded yet.
-    Each dict stores only the file path (as bytes) + pre-parsed annotations.
-    Images are loaded lazily when the sample is accessed.
-    """
     coco = COCO(ann_file)
     samples = []
 
@@ -44,7 +40,6 @@ def load_coco(img_dir, ann_file, img_size=640):
         img_info = coco.loadImgs(img_id)[0]
         path = f"{img_dir}/{img_info['file_name']}"
 
-        # ── annotations only (fast, no I/O) ──────────────────────────────
         ann_ids = coco.getAnnIds(imgIds=img_id, iscrowd=False)
         anns = coco.loadAnns(ann_ids)
         orig_w, orig_h = img_info["width"], img_info["height"]
@@ -61,63 +56,116 @@ def load_coco(img_dir, ann_file, img_size=640):
 
         samples.append(
             {
-                "image": path.encode("ascii"),  # NOTE: this is actually the path
+                "image_path": path,
                 "boxes": boxes,
                 "labels": labels,
-                "num_objects": np.int32(len(labels)),
+                "num_objects": len(labels),
             }
         )
 
     return samples
 
 
-def make_stream(img_dir, ann_file, img_size=640, batch_size=16, shuffle=False):
-    samples = load_coco(img_dir, ann_file, img_size)  # instant — no image I/O
+class CocoDetectionDataset(Dataset):
+    def __init__(self, samples, img_size=640):
+        self.samples = samples
+        self.img_size = img_size
 
-    def load_and_letterbox(path_bytes):
-        """Called per-sample only when the batch is prefetched."""
-        path = path_bytes.tobytes().decode("ascii")
-        image = Image.open(path).convert("RGB")
-        image, _, _, _ = letterbox(image, img_size)
-        return np.array(image, dtype=np.float32) / 255.0
+    def __len__(self):
+        return len(self.samples)
 
-    buffer = dx.buffer_from_vector(samples)
-    if shuffle:
-        buffer = buffer.shuffle()
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        image = Image.open(sample["image_path"]).convert("RGB")
+        image, _, _, _ = letterbox(image, self.img_size)
+        image = np.array(image, dtype=np.float32) / 255.0
+        image = torch.from_numpy(image).permute(2, 0, 1)  # NCHW
 
-    return (
-        buffer.to_stream()
-        .key_transform("image", load_and_letterbox)  # lazy I/O here
-        .batch(batch_size)
-        .prefetch(prefetch_size=8, num_threads=8)  # parallel image loading
-    ), len(samples)
+        max_objs = 100
+        boxes = np.zeros((max_objs, 4), dtype=np.float32)
+        labels = np.zeros((max_objs,), dtype=np.int32)
+        n = min(sample["num_objects"], max_objs)
+        if n > 0:
+            boxes[:n] = sample["boxes"][:n]
+            labels[:n] = sample["labels"][:n]
+
+        return {
+            "image": image,
+            "boxes": torch.from_numpy(boxes),
+            "labels": torch.from_numpy(labels),
+            "num_objects": n,
+        }
+
+
+def collate_fn(batch):
+    images = torch.stack([b["image"] for b in batch])
+    boxes = torch.stack([b["boxes"] for b in batch])
+    labels = torch.stack([b["labels"] for b in batch])
+    num_objects = torch.tensor([b["num_objects"] for b in batch])
+    return {
+        "image": images,
+        "boxes": boxes,
+        "labels": labels,
+        "num_objects": num_objects,
+    }
+
+
+def make_dataloader(
+    img_dir,
+    ann_file,
+    img_size=640,
+    batch_size=16,
+    shuffle=False,
+    num_workers=4,
+    pin_memory=None,
+):
+    samples = load_coco(img_dir, ann_file, img_size)
+    dataset = CocoDetectionDataset(samples, img_size=img_size)
+
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+    num_batches = (len(dataset) + batch_size - 1) // batch_size
+    return loader, num_batches
+
+
+# Backwards-compatible alias
+make_stream = make_dataloader
 
 
 if __name__ == "__main__":
     import time
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
-    import mlx.core as mx
 
     img_size = 224
 
     t0 = time.time()
-    stream, _ = make_stream(
+    loader, _ = make_dataloader(
         "coco/images/val2017",
         "coco/annotations/instances_val2017.json",
         img_size=img_size,
         batch_size=16,
         shuffle=False,
+        num_workers=0,
     )
-    print(f"Stream ready in {time.time() - t0:.2f}s")
+    print(f"DataLoader ready in {time.time() - t0:.2f}s")
 
-    stream.reset()
-    batch = next(stream)
-    images = mx.array(batch["image"])  # (B, H, W, 3)
-    boxes = np.array(batch["boxes"])  # (B, N, 4)
-    n_objs = np.array(batch["num_objects"])  # (B,)
+    batch = next(iter(loader))
+    images = batch["image"]
+    boxes = batch["boxes"].numpy()
+    n_objs = batch["num_objects"].numpy()
 
-    img = np.array(images[0])
+    img = images[0].permute(1, 2, 0).numpy()
 
     print(img.shape)
     fig, ax = plt.subplots(1)

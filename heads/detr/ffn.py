@@ -1,5 +1,6 @@
-import mlx.nn as nn
-import mlx.core as mx
+import torch
+import torch.nn as nn
+
 
 class FFN(nn.Module):
     def __init__(self, dim, hidden_dim, out_dim=None, n_layers=1, dropout=0.0):
@@ -14,8 +15,7 @@ class FFN(nn.Module):
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
         layers.append(nn.Linear(hidden_dim, out_dim))
-        # layers.append(nn.Dropout(dropout))
         self.layers = nn.Sequential(*layers)
 
-    def __call__(self, x) -> mx.array:
+    def forward(self, x) -> torch.Tensor:
         return self.layers(x)

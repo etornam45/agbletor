@@ -1,113 +1,83 @@
-import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
-from scipy.optimize import linear_sum_assignment
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from scipy.optimize import linear_sum_assignment
+from typing import Dict, List, Tuple
 
 
-def box_cxcywh_to_xyxy(boxes: mx.array) -> mx.array:
-    """Convert [cx, cy, w, h] → [x1, y1, x2, y2]."""
-    cx, cy, w, h = boxes[..., 0], boxes[..., 1], boxes[..., 2], boxes[..., 3]
-    return mx.stack([cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h], axis=-1)
+def box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    cx, cy, w, h = boxes.unbind(-1)
+    return torch.stack([cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h], dim=-1)
 
 
-def box_area(boxes: mx.array) -> mx.array:
-    """Area of boxes in [x1, y1, x2, y2] format."""
+def box_area(boxes: torch.Tensor) -> torch.Tensor:
     return (boxes[..., 2] - boxes[..., 0]) * (boxes[..., 3] - boxes[..., 1])
 
 
-def generalized_iou(boxes_a: mx.array, boxes_b: mx.array) -> mx.array:
-    """
-    Pairwise Generalised IoU between two sets of boxes.
+def generalized_iou(boxes_a: torch.Tensor, boxes_b: torch.Tensor) -> torch.Tensor:
+    inter_x1 = torch.maximum(boxes_a[:, None, 0], boxes_b[None, :, 0])
+    inter_y1 = torch.maximum(boxes_a[:, None, 1], boxes_b[None, :, 1])
+    inter_x2 = torch.minimum(boxes_a[:, None, 2], boxes_b[None, :, 2])
+    inter_y2 = torch.minimum(boxes_a[:, None, 3], boxes_b[None, :, 3])
 
-    Args:
-        boxes_a: (N, 4) in xyxy format
-        boxes_b: (M, 4) in xyxy format
-    Returns:
-        giou: (N, M) matrix
-    """
-    # Intersection
-    inter_x1 = mx.maximum(boxes_a[:, None, 0], boxes_b[None, :, 0])
-    inter_y1 = mx.maximum(boxes_a[:, None, 1], boxes_b[None, :, 1])
-    inter_x2 = mx.minimum(boxes_a[:, None, 2], boxes_b[None, :, 2])
-    inter_y2 = mx.minimum(boxes_a[:, None, 3], boxes_b[None, :, 3])
-
-    inter_w = mx.maximum(inter_x2 - inter_x1, mx.zeros_like(inter_x2))
-    inter_h = mx.maximum(inter_y2 - inter_y1, mx.zeros_like(inter_y2))
+    inter_w = torch.clamp(inter_x2 - inter_x1, min=0)
+    inter_h = torch.clamp(inter_y2 - inter_y1, min=0)
     inter_area = inter_w * inter_h
 
-    area_a = box_area(boxes_a)[:, None]  # (N, 1)
-    area_b = box_area(boxes_b)[None, :]  # (1, M)
+    area_a = box_area(boxes_a)[:, None]
+    area_b = box_area(boxes_b)[None, :]
     union_area = area_a + area_b - inter_area
 
-    iou = inter_area / mx.maximum(union_area, mx.array(1e-6))
+    iou = inter_area / torch.clamp(union_area, min=1e-6)
 
-    # Enclosing box
-    enc_x1 = mx.minimum(boxes_a[:, None, 0], boxes_b[None, :, 0])
-    enc_y1 = mx.minimum(boxes_a[:, None, 1], boxes_b[None, :, 1])
-    enc_x2 = mx.maximum(boxes_a[:, None, 2], boxes_b[None, :, 2])
-    enc_y2 = mx.maximum(boxes_a[:, None, 3], boxes_b[None, :, 3])
+    enc_x1 = torch.minimum(boxes_a[:, None, 0], boxes_b[None, :, 0])
+    enc_y1 = torch.minimum(boxes_a[:, None, 1], boxes_b[None, :, 1])
+    enc_x2 = torch.maximum(boxes_a[:, None, 2], boxes_b[None, :, 2])
+    enc_y2 = torch.maximum(boxes_a[:, None, 3], boxes_b[None, :, 3])
     enc_area = (enc_x2 - enc_x1) * (enc_y2 - enc_y1)
 
-    giou = iou - (enc_area - union_area) / mx.maximum(enc_area, mx.array(1e-6))
+    giou = iou - (enc_area - union_area) / torch.clamp(enc_area, min=1e-6)
     return giou
 
 
 def build_cost_matrix(
-    pred_logits: mx.array,  # (num_queries, num_classes)
-    pred_boxes: mx.array,  # (num_queries, 4)  cx cy w h, normalised
-    gt_labels: mx.array,  # (num_gt,)
-    gt_boxes: mx.array,  # (num_gt, 4)  cx cy w h, normalised
+    pred_logits: torch.Tensor,
+    pred_boxes: torch.Tensor,
+    gt_labels: torch.Tensor,
+    gt_boxes: torch.Tensor,
     cost_class: float = 1.0,
     cost_bbox: float = 5.0,
     cost_giou: float = 2.0,
 ) -> np.ndarray:
-    """
-    Build the (num_queries × num_gt) cost matrix used by the Hungarian solver.
+    probs = F.softmax(pred_logits, dim=-1).detach().cpu().numpy()
+    gt_idx = gt_labels.detach().cpu().numpy().astype(np.int32)
+    cost_cls = -probs[:, gt_idx]
 
-    Classification cost   – negative softmax probability of the GT class.
-    L1 box cost           – mean absolute error between normalised boxes.
-    GIoU cost             – negative GIoU (higher overlap = lower cost).
-    """
+    pb = pred_boxes.detach().cpu().numpy()
+    gb = gt_boxes.detach().cpu().numpy()
+    cost_l1 = np.sum(np.abs(pb[:, None, :] - gb[None, :, :]), axis=-1)
 
-    # --- classification cost -------------------------------------------
-    probs = mx.softmax(pred_logits, axis=-1)  # (Q, C)
-    # Select the GT-class probability for every (query, gt) pair
-    gt_idx = np.array(gt_labels.tolist(), dtype=np.int32)
-    cost_cls = -np.array(probs.tolist())[:, gt_idx]  # (Q, num_gt)
+    pb_xyxy = box_cxcywh_to_xyxy(pred_boxes).detach().cpu().numpy()
+    gb_xyxy = box_cxcywh_to_xyxy(gt_boxes).detach().cpu().numpy()
+    cost_giou_mat = -generalized_iou(
+        torch.tensor(pb_xyxy), torch.tensor(gb_xyxy)
+    ).numpy()
 
-    # --- L1 box cost ---------------------------------------------------
-    pb = np.array(pred_boxes.tolist())  # (Q, 4)
-    gb = np.array(gt_boxes.tolist())  # (num_gt, 4)
-    cost_l1 = np.sum(np.abs(pb[:, None, :] - gb[None, :, :]), axis=-1)  # (Q, G)
-
-    # --- GIoU cost -----------------------------------------------------
-    pb_xyxy = box_cxcywh_to_xyxy(pred_boxes)
-    gb_xyxy = box_cxcywh_to_xyxy(gt_boxes)
-    cost_giou_mat = -np.array(generalized_iou(pb_xyxy, gb_xyxy).tolist())  # (Q, G)
-
-    # --- combined cost -------------------------------------------------
     C = cost_class * cost_cls + cost_bbox * cost_l1 + cost_giou * cost_giou_mat
     return C.astype(np.float32)
 
 
 def hungarian_match(
-    pred_logits: mx.array,
-    pred_boxes: mx.array,
-    gt_labels: mx.array,
-    gt_boxes: mx.array,
+    pred_logits: torch.Tensor,
+    pred_boxes: torch.Tensor,
+    gt_labels: torch.Tensor,
+    gt_boxes: torch.Tensor,
     cost_class: float = 1.0,
     cost_bbox: float = 5.0,
     cost_giou: float = 2.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Find the optimal query → gt assignment for a single image.
-
-    Returns:
-        query_indices  (K,)  – which queries were matched
-        gt_indices     (K,)  – the GT they were matched to
-    """
     if gt_labels.shape[0] == 0:
         return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
 
@@ -124,11 +94,6 @@ def hungarian_match(
     return query_idx.astype(np.int64), gt_idx.astype(np.int64)
 
 
-def one_hot(labels: mx.array, num_classes: int) -> mx.array:
-    # Create an identity matrix and index into it using your labels
-    return mx.eye(num_classes)[labels]
-
-
 @dataclass
 class LossStats:
     total: float
@@ -139,20 +104,6 @@ class LossStats:
 
 
 class HungarianLoss(nn.Module):
-    """
-    End-to-end set-prediction loss using optimal bipartite matching.
-
-    Args:
-        num_classes:   number of foreground classes (background is implicit)
-        cost_class:    weight of the classification term in the matching cost
-        cost_bbox:     weight of the L1 box term in the matching cost
-        cost_giou:     weight of the GIoU term in the matching cost
-        loss_class:    weight of the classification term in the training loss
-        loss_bbox:     weight of the L1 box term in the training loss
-        loss_giou:     weight of the GIoU term in the training loss
-        no_obj_coef:   down-weighting for the background class in cross-entropy
-    """
-
     def __init__(
         self,
         num_classes: int,
@@ -176,130 +127,121 @@ class HungarianLoss(nn.Module):
 
     def _cls_loss(
         self,
-        pred_logits: mx.array,  # (Q, C+1)
-        gt_labels: mx.array,  # (num_gt,)
-        query_idx: np.ndarray,  # matched query positions
-        gt_idx: np.ndarray,  # matched GT positions
-    ) -> mx.array:
-        """
-        Cross-entropy loss over all queries.
-        Unmatched queries are assigned the background class (index num_classes).
-        """
+        pred_logits: torch.Tensor,
+        gt_labels: torch.Tensor,
+        query_idx: np.ndarray,
+        gt_idx: np.ndarray,
+    ) -> torch.Tensor:
         num_queries = pred_logits.shape[0]
-        # Default target: background class
         targets = np.full((num_queries,), self.num_classes, dtype=np.int32)
         if len(query_idx) > 0:
-            targets[query_idx] = np.array(gt_labels.tolist(), dtype=np.int32)[gt_idx]
+            targets[query_idx] = gt_labels.detach().cpu().numpy().astype(np.int32)[gt_idx]
 
-        targets_mx = mx.array(targets)
+        targets_t = torch.tensor(targets, device=pred_logits.device, dtype=torch.long)
 
-        # Class weights: background gets no_obj_coef, foreground gets 1.0
-        weights = np.ones(self.num_classes + 1, dtype=np.float32)
+        weights = torch.ones(self.num_classes + 1, device=pred_logits.device)
         weights[self.num_classes] = self.no_obj_coef
-        w = mx.array(weights)
 
-        log_probs = mx.log(mx.softmax(pred_logits, axis=-1) + 1e-8)  # (Q, C+1)
-        # Gather the log-prob of the target class for each query
-        _one_hot = one_hot(targets_mx, self.num_classes + 1)  # (Q, C+1)
-        nll = -mx.sum(log_probs * _one_hot, axis=-1)  # (Q,)
-        sample_weights = w[targets_mx]  # (Q,)
-        return mx.mean(nll * sample_weights)
+        log_probs = F.log_softmax(pred_logits, dim=-1)
+        nll = -log_probs.gather(1, targets_t.unsqueeze(1)).squeeze(1)
+        sample_weights = weights[targets_t]
+        return (nll * sample_weights).mean()
 
     def _box_losses(
         self,
-        pred_boxes: mx.array,  # (Q, 4)
-        gt_boxes: mx.array,  # (num_gt, 4)
+        pred_boxes: torch.Tensor,
+        gt_boxes: torch.Tensor,
         query_idx: np.ndarray,
         gt_idx: np.ndarray,
-    ) -> Tuple[mx.array, mx.array]:
-        """L1 and GIoU losses computed only on matched pairs."""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if len(query_idx) == 0:
-            zero = mx.array(0.0)
+            zero = torch.tensor(0.0, device=pred_boxes.device)
             return zero, zero
 
-        matched_pred = pred_boxes[mx.array(query_idx)]
-        matched_gt = gt_boxes[mx.array(gt_idx)]
+        matched_pred = pred_boxes[query_idx]
+        matched_gt = gt_boxes[gt_idx]
 
-        l1 = mx.mean(mx.abs(matched_pred - matched_gt))
+        l1 = F.l1_loss(matched_pred, matched_gt)
 
         pb_xyxy = box_cxcywh_to_xyxy(matched_pred)
         gb_xyxy = box_cxcywh_to_xyxy(matched_gt)
-        # Diagonal of the pairwise GIoU matrix = per-pair GIoU
-        giou_diag = mx.diagonal(generalized_iou(pb_xyxy, gb_xyxy))
-        giou = mx.mean(1.0 - giou_diag)
+        giou_diag = torch.diag(generalized_iou(pb_xyxy, gb_xyxy))
+        giou = (1.0 - giou_diag).mean()
 
         return l1, giou
 
     def _single_pass(
         self,
-        predictions: Dict[str, mx.array],
+        predictions: Dict[str, torch.Tensor],
         targets,
-    ) -> Tuple[mx.array, List[LossStats]]:
-        """Compute loss for ONE set of predictions (final or aux)."""
-        pred_logits = predictions["logits"]   # (B, Q, C+1)
-        pred_boxes  = predictions["boxes"]    # (B, Q, 4)
-        batch_size  = pred_logits.shape[0]
+    ) -> Tuple[torch.Tensor, List[LossStats]]:
+        pred_logits = predictions["logits"]
+        pred_boxes = predictions["boxes"]
+        batch_size = pred_logits.shape[0]
 
-        total_cls  = mx.array(0.0)
-        total_l1   = mx.array(0.0)
-        total_giou = mx.array(0.0)
+        total_cls = torch.tensor(0.0, device=pred_logits.device)
+        total_l1 = torch.tensor(0.0, device=pred_logits.device)
+        total_giou = torch.tensor(0.0, device=pred_logits.device)
         stats: List[LossStats] = []
 
         for i in range(batch_size):
             if isinstance(targets, dict):
-                labels_np = np.array(targets["labels"][i])
+                labels_np = targets["labels"][i].detach().cpu().numpy()
                 valid_idx = [j for j, v in enumerate(labels_np.tolist()) if v > 0]
                 if valid_idx:
-                    idx_mx   = mx.array(valid_idx)
-                    gt_labels = mx.array(targets["labels"][i])[idx_mx]
-                    gt_boxes  = mx.array(targets["boxes"][i])[idx_mx]
+                    idx = torch.tensor(valid_idx, device=pred_logits.device)
+                    gt_labels = targets["labels"][i][idx]
+                    gt_boxes = targets["boxes"][i][idx]
                 else:
-                    gt_labels = mx.array([], dtype=mx.int32)
-                    gt_boxes  = mx.array([], dtype=mx.float32).reshape(0, 4)
+                    gt_labels = torch.tensor([], device=pred_logits.device, dtype=torch.long)
+                    gt_boxes = torch.zeros((0, 4), device=pred_logits.device)
             else:
-                gt_labels = mx.array(targets[i]["labels"])
-                gt_boxes  = mx.array(targets[i]["boxes"])
+                gt_labels = targets[i]["labels"]
+                gt_boxes = targets[i]["boxes"]
 
             q_idx, g_idx = hungarian_match(
-                pred_logits[i], pred_boxes[i],
-                gt_labels, gt_boxes,
-                self.cost_class, self.cost_bbox, self.cost_giou,
+                pred_logits[i],
+                pred_boxes[i],
+                gt_labels,
+                gt_boxes,
+                self.cost_class,
+                self.cost_bbox,
+                self.cost_giou,
             )
 
-            cls_l       = self._cls_loss(pred_logits[i], gt_labels, q_idx, g_idx)
+            cls_l = self._cls_loss(pred_logits[i], gt_labels, q_idx, g_idx)
             l1_l, giou_l = self._box_losses(pred_boxes[i], gt_boxes, q_idx, g_idx)
 
-            total_cls  = total_cls  + cls_l
-            total_l1   = total_l1   + l1_l
+            total_cls = total_cls + cls_l
+            total_l1 = total_l1 + l1_l
             total_giou = total_giou + giou_l
 
-            stats.append(LossStats(
-                total=0.0,
-                cls=float(cls_l.tolist()),
-                bbox_l1=float(l1_l.tolist()),
-                bbox_giou=float(giou_l.tolist()),
-                num_matched=len(q_idx),
-            ))
+            stats.append(
+                LossStats(
+                    total=0.0,
+                    cls=float(cls_l.item()),
+                    bbox_l1=float(l1_l.item()),
+                    bbox_giou=float(giou_l.item()),
+                    num_matched=len(q_idx),
+                )
+            )
 
         loss = (
             self.loss_class * total_cls / batch_size
-            + self.loss_bbox * total_l1  / batch_size
+            + self.loss_bbox * total_l1 / batch_size
             + self.loss_giou * total_giou / batch_size
         )
         return loss, stats
 
-    def __call__(
+    def forward(
         self,
-        predictions: Dict[str, mx.array],
+        predictions: Dict[str, torch.Tensor],
         targets,
-        aux_weight: float = 0.5,      # ← weight for intermediate layers
-    ) -> Tuple[mx.array, List[LossStats]]:
-
-        # Final layer loss
+        aux_weight: float = 0.5,
+    ) -> Tuple[torch.Tensor, List[LossStats]]:
         final_loss, stats = self._single_pass(predictions, targets)
 
-        # Aux losses — same matching, down-weighted
-        aux_loss = mx.array(0.0)
+        aux_loss = torch.tensor(0.0, device=final_loss.device)
         for aux_pred in predictions.get("aux", []):
             layer_loss, _ = self._single_pass(aux_pred, targets)
             aux_loss = aux_loss + layer_loss
@@ -307,26 +249,28 @@ class HungarianLoss(nn.Module):
         total_loss = final_loss + aux_weight * aux_loss
 
         for s in stats:
-            s.total = float(total_loss.tolist())
+            s.total = float(total_loss.item())
 
         return total_loss, stats
 
 
 if __name__ == "__main__":
-    # Example usage
+    from dinov3.utils.device import get_device
+
+    device = get_device()
     loss_fn = HungarianLoss(num_classes=80)
     predictions = {
-        "logits": mx.random.normal((2, 300, 81)),
-        "boxes": mx.random.uniform(shape=(2, 300, 4)),
+        "logits": torch.randn(2, 300, 81, device=device),
+        "boxes": torch.rand(2, 300, 4, device=device),
     }
     targets = [
         {
-            "labels": mx.array([1, 2, 3]),
-            "boxes": mx.random.uniform(shape=(3, 4)),
+            "labels": torch.tensor([1, 2, 3], device=device),
+            "boxes": torch.rand(3, 4, device=device),
         },
         {
-            "labels": mx.array([4, 5]),
-            "boxes": mx.random.uniform(shape=(2, 4)),
+            "labels": torch.tensor([4, 5], device=device),
+            "boxes": torch.rand(2, 4, device=device),
         },
     ]
     loss, stats = loss_fn(predictions, targets)

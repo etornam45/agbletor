@@ -1,29 +1,29 @@
 from tqdm import tqdm
-import mlx.nn as nn
-import mlx.core as mx
+import torch
+import torch.optim as optim
 
-import mlx.optimizers as optim
+from dinov3.checkpoints.load import load_checkpoint
 from dinov3.models import vit_small
-from dinov3.checkpoints.quantize import quantize_model
-from heads.detr.transformer import DETR
-from heads.detr.dataset import make_stream
+from dinov3.utils.device import get_device
+from heads.detr.dataset import make_dataloader
 from heads.detr.matcher import HungarianLoss
-from heads.detr.transformer import build_detr
+from heads.detr.transformer import DETR, build_detr
 
-mx.set_default_device(mx.gpu)
+device = get_device()
+print(f"Using device: {device}")
 
-dset, dset_ln = make_stream(
+loader, num_batches = make_dataloader(
     "coco/images/val2017",
     "coco/annotations/instances_val2017.json",
     img_size=224,
     batch_size=32,
     shuffle=True,
 )
-print("Total dataset length:", dset_ln)
+print("Total batches per epoch:", num_batches)
 
-BACKBONE_WEIGHTS = "dinov3/checkpoints/model/vit-small.safetensors"
-QUANT_BITS = 4
-QUANT_GROUP_SIZE = 64
+BACKBONE_WEIGHTS = (
+    "dinov3/checkpoints/model/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+)
 
 dinov3_small = vit_small(
     patch_size=16,
@@ -31,71 +31,58 @@ dinov3_small = vit_small(
     layerscale_init=1e-5,
     mask_k_bias=True,
 )
-dinov3_small.load_weights(BACKBONE_WEIGHTS)
-quantize_model(
-    dinov3_small,
-    bits=QUANT_BITS,
-    group_size=QUANT_GROUP_SIZE,
-    mode="affine",
-    quantize_input=False,
-    skip_masked_qkv=True,
-)
-dinov3_small.freeze()
-total = sum(p.size for _, p in nn.utils.tree_flatten(dinov3_small.parameters()))
-print(f"Total parameters: {total / 1e6:.1f}M")
+load_checkpoint(dinov3_small, BACKBONE_WEIGHTS)
+dinov3_small.to(device)
+dinov3_small.eval()
+for p in dinov3_small.parameters():
+    p.requires_grad = False
+
+total = sum(p.numel() for p in dinov3_small.parameters())
+print(f"Total backbone parameters: {total / 1e6:.1f}M")
 
 detr_decoder = build_detr(
     d_model=384,
     num_layers=3,
     n_classes=92,
     n_points=4,
-)
-quantize_model(
-    detr_decoder,
-    bits=QUANT_BITS,
-    group_size=QUANT_GROUP_SIZE,
-    mode="affine",
-    quantize_input=False,
-    skip_masked_qkv=True,
-)
-out_path = "dinov3/checkpoints/model/detr_decoder_q4.safetensors"
-# detr_decoder.load_weights(out_path)
+).to(device)
 
+out_path = "dinov3/checkpoints/model/detr_decoder.pt"
 
-total = sum(p.size for _, p in nn.utils.tree_flatten(detr_decoder.parameters()))
+total = sum(p.numel() for p in detr_decoder.parameters())
 print(f"Total Decoder parameters: {total / 1e6:.1f}M")
 
-optimizer = optim.AdamW(learning_rate=1e-5, weight_decay=0.01)
+optimizer = optim.AdamW(detr_decoder.parameters(), lr=1e-5, weight_decay=0.01)
 lf = HungarianLoss(num_classes=91)
 
 
-def loss_fn(model: DETR, img_embed, target):
+def train_step(model: DETR, img_embed, target):
     out = model(img_embed)
     loss, stats = lf(out, target)
-    return loss
-
-
-loss_and_grad_fn = nn.value_and_grad(detr_decoder, loss_fn)
+    return loss, stats
 
 
 for i in range(50):
-    dset.reset()
-    total_loss = 0
-    prog_bar = tqdm(dset, desc="Training", unit="batch", total=dset_ln / 32)
+    total_loss = 0.0
+    prog_bar = tqdm(loader, desc="Training", unit="batch", total=num_batches)
     for batch in prog_bar:
-        image = mx.array(batch["image"])
-        image = image.transpose(0, 3, 1, 2)
-        patches = dinov3_small(image, masks=None, is_training=True)[
-            "x_norm_patchtokens"
-        ]
+        image = batch["image"].to(device)
+        target = {
+            "boxes": batch["boxes"].to(device),
+            "labels": batch["labels"].to(device),
+        }
 
-        loss, grad = loss_and_grad_fn(detr_decoder, patches, batch)
-        optimizer.update(detr_decoder, grad)
+        with torch.no_grad():
+            features = dinov3_small(image, masks=None, is_training=True)
+            patches = features["x_norm_patchtokens"]
 
-        mx.eval(loss, detr_decoder.parameters(), grad, optimizer.state)
-        # print(f"Loss: {loss.item()}")
+        optimizer.zero_grad()
+        loss, _ = train_step(detr_decoder, patches, target)
+        loss.backward()
+        optimizer.step()
+
         prog_bar.set_postfix(loss=f"{loss.item():.4f}")
         total_loss += loss.item()
     prog_bar.close()
-    print(f"Epoch {i}, Loss: {total_loss / (dset_ln / 32)}")
-    detr_decoder.save_weights(out_path)
+    print(f"Epoch {i}, Loss: {total_loss / num_batches}")
+    torch.save(detr_decoder.state_dict(), out_path)

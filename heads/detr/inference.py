@@ -1,11 +1,15 @@
-from heads.detr.dataset import letterbox
 import numpy as np
+import torch
+import torch.nn.functional as F
 from PIL import Image
-import mlx.core as mx
-from heads.detr.transformer import build_detr
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+
+from dinov3.checkpoints.load import load_checkpoint
 from dinov3.models import vit_small
+from dinov3.utils.device import get_device
+from heads.detr.dataset import letterbox
+from heads.detr.transformer import build_detr
 
 COCO_CLASSES = [
     "N/A",
@@ -103,14 +107,19 @@ COCO_CLASSES = [
 
 
 def run_inference(image_path="test/test5.jpeg", threshold=0.62):
+    device = get_device()
+
     dinov3_small = vit_small(
         patch_size=16,
         n_storage_tokens=4,
         layerscale_init=1e-5,
         mask_k_bias=True,
     )
-
-    dinov3_small.load_weights("dinov3/checkpoints/model/vit-small.safetensors")
+    load_checkpoint(
+        dinov3_small,
+        "dinov3/checkpoints/model/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+    )
+    dinov3_small.to(device)
     dinov3_small.eval()
 
     detr_decoder = build_detr(
@@ -118,65 +127,52 @@ def run_inference(image_path="test/test5.jpeg", threshold=0.62):
         num_layers=3,
         n_classes=92,
         n_points=4,
+    ).to(device)
+    detr_decoder.load_state_dict(
+        torch.load(
+            "dinov3/checkpoints/model/detr_decoder.pt",
+            map_location=device,
+            weights_only=True,
+        )
     )
-    detr_decoder.load_weights("dinov3/checkpoints/model/detr_decoder.safetensors")
     detr_decoder.eval()
 
-    # 2. Preprocess Image
     img_pil = Image.open(image_path).convert("RGB")
     img_pil, _, _, _ = letterbox(img_pil, 224)
     img_arr = np.array(img_pil, dtype=np.float32) / 255.0
-    image = mx.array(img_arr)[None]  # NHWC: (1, 224, 224, 3)
+    image = torch.from_numpy(img_arr).permute(2, 0, 1).unsqueeze(0).to(device)
 
-    features = dinov3_small(image, masks=None, is_training=True)
-    patch_tokens = features["x_norm_patchtokens"]
+    with torch.no_grad():
+        features = dinov3_small(image, masks=None, is_training=True)
+        patch_tokens = features["x_norm_patchtokens"]
+        output = detr_decoder(patch_tokens)
 
-    # DETR Decoder
-    output = detr_decoder(patch_tokens)
-
-    # 4. Post-process
-    # Logits shape: (1, 50, 92), Boxes shape: (1, 50, 4)
     logits = output["logits"][0]
     boxes = output["boxes"][0]
 
-    # Convert logits to probabilities and filter by threshold
-    probs = mx.softmax(logits, axis=-1)
-    # The last class (index 91) is 'no object'
-    scores = mx.max(probs[:, :-1], axis=-1)
-    labels = mx.argmax(probs[:, :-1], axis=-1)
+    probs = F.softmax(logits, dim=-1)
+    scores, labels = probs[:, :-1].max(dim=-1)
 
-    keep = (scores > threshold).tolist()
-    keep_indices = [i for i, val in enumerate(keep) if val]
+    keep = scores > threshold
+    scores = scores[keep].cpu().numpy()
+    labels = labels[keep].cpu().numpy()
+    boxes = boxes[keep].cpu().numpy()
 
-    if len(keep_indices) > 0:
-        indices = mx.array(keep_indices)
-        scores = np.array(scores[indices].tolist())
-        labels = np.array(labels[indices].tolist())
-        boxes = np.array(boxes[indices].tolist())
-    else:
-        scores = np.array([])
-        labels = np.array([])
-        boxes = np.array([]).reshape(0, 4)
-
-    # 5. Visualization
     img_size = 224
     fig, ax = plt.subplots(1, figsize=(8, 8))
     ax.imshow(img_arr)
 
     for score, label, (cx, cy, w, h) in zip(scores, labels, boxes):
-        # Convert [cx, cy, w, h] normalized to [x, y, w, h] pixel
         x = (cx - w / 2) * img_size
         y = (cy - h / 2) * img_size
         pw = w * img_size
         ph = h * img_size
 
-        # Draw Box
         rect = patches.Rectangle(
             (x, y), pw, ph, linewidth=2, edgecolor="red", facecolor="none", alpha=0.9
         )
         ax.add_patch(rect)
 
-        # Add Label
         class_name = (
             COCO_CLASSES[label] if label < len(COCO_CLASSES) else f"Class {label}"
         )
