@@ -3,7 +3,9 @@ Load official DINOv3 PyTorch checkpoints into dinov3 models.
 """
 
 import argparse
+import hashlib
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -19,6 +21,14 @@ from dinov3.models import (
     vit_small,
     vit_so400m,
 )
+
+DEFAULT_VITS16_CHECKPOINT = (
+    "dinov3/checkpoints/model/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+)
+VITS16_CHECKPOINT_NAME = "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+VITS16_MIN_BYTES = 80_000_000
+VITS16_SHA256 = "08c60483bc63c04f533611e34bf70b120eedb7240f469bc16e9e20bf344b941d"
+VITS16_HF_REPO = "kshitijrajsharma/dinov3"
 
 MODEL_MAP = {
     "vit_small": vit_small,
@@ -106,12 +116,98 @@ def build_model(
     return MODEL_MAP[model_type](patch_size=patch_size, **kwargs)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_checkpoint_file(
+    pth_path: str,
+    min_bytes: int = VITS16_MIN_BYTES,
+    expected_sha256: Optional[str] = VITS16_SHA256,
+) -> bool:
+    path = Path(pth_path)
+    if not path.is_file():
+        return False
+    if path.stat().st_size < min_bytes:
+        return False
+    if expected_sha256 and _sha256_file(path) != expected_sha256:
+        return False
+    try:
+        torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        return False
+    return True
+
+
+def download_vits16_checkpoint(dest_path: str) -> str:
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise ImportError(
+            "huggingface_hub is required to download checkpoints. "
+            "Install with: pip install huggingface_hub"
+        ) from exc
+
+    dest = Path(dest_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"Downloading {VITS16_CHECKPOINT_NAME} from {VITS16_HF_REPO}...")
+    cached = hf_hub_download(
+        repo_id=VITS16_HF_REPO,
+        filename=VITS16_CHECKPOINT_NAME,
+    )
+    shutil.copy2(cached, dest)
+
+    if not validate_checkpoint_file(dest_path):
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Downloaded checkpoint at {dest_path} failed validation."
+        )
+
+    print(f"Saved DINOv3 ViT-S weights to {dest_path}")
+    return dest_path
+
+
+def ensure_backbone_checkpoint(
+    pth_path: str = DEFAULT_VITS16_CHECKPOINT,
+    auto_download: bool = True,
+) -> str:
+    if validate_checkpoint_file(pth_path):
+        return pth_path
+
+    path = Path(pth_path)
+    if path.exists():
+        print(f"Removing invalid checkpoint: {pth_path}")
+        path.unlink()
+
+    if not auto_download:
+        raise FileNotFoundError(
+            f"DINOv3 checkpoint missing or corrupt at {pth_path}. "
+            "Download the official .pth from Meta's DINOv3 page or run with "
+            "auto_download=True."
+        )
+
+    return download_vits16_checkpoint(pth_path)
+
+
 def load_checkpoint(
     model: torch.nn.Module,
     pth_path: str,
     strict: bool = True,
 ) -> torch.nn.Module:
-    state = torch.load(pth_path, map_location="cpu", weights_only=True)
+    try:
+        state = torch.load(pth_path, map_location="cpu", weights_only=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to load checkpoint at {pth_path}. The file may be "
+            "corrupt or incomplete (common after interrupted downloads). "
+            "Delete it and re-download, or call "
+            "dinov3.checkpoints.load.ensure_backbone_checkpoint()."
+        ) from exc
     state_dict = extract_state_dict(state)
     model.load_state_dict(state_dict, strict=strict)
     return model
