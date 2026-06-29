@@ -1,5 +1,6 @@
-from tqdm import tqdm
+import os
 import torch
+from tqdm import tqdm
 import torch.optim as optim
 
 from dinov3.checkpoints.load import load_checkpoint
@@ -16,7 +17,7 @@ loader, num_batches = make_dataloader(
     "coco/images/val2017",
     "coco/annotations/instances_val2017.json",
     img_size=224,
-    batch_size=32,
+    batch_size=16,
     shuffle=True,
 )
 print("Total batches per epoch:", num_batches)
@@ -42,12 +43,15 @@ print(f"Total backbone parameters: {total / 1e6:.1f}M")
 
 detr_decoder = build_detr(
     d_model=384,
-    num_layers=3,
+    num_layers=4,
     n_classes=92,
-    n_points=4,
+    n_points=5,
 ).to(device)
 
 out_path = "dinov3/checkpoints/model/detr_decoder.pt"
+if os.path.exists(out_path):
+    state_dict = torch.load(out_path)
+    detr_decoder.load_state_dict(state_dict)
 
 total = sum(p.numel() for p in detr_decoder.parameters())
 print(f"Total Decoder parameters: {total / 1e6:.1f}M")
