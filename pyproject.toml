@@ -1,7 +1,7 @@
 [project]
 name = "dinov3"
 version = "0.1.0"
-description = "PyTorch DINOv3 with DETR detection head"
+description = "PyTorch DINOv3 with DETR detection and DINOv3+MiniCPM VQA heads"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -15,4 +15,8 @@ dependencies = [
     "tqdm",
     "pyyaml",
     "safetensors",
+    "datasets",
+    "nltk",
+    "peft",
+    "accelerate",
 ]

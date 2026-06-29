@@ -18,3 +18,5 @@ wheels/
 
 coco
 test
+.cursor/plans/captioning_head_vlm_20e82a93.plan.md
+.cursor/plans/dinov3_minicpm_vqa_2dbb8bca.plan.md

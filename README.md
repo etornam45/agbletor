@@ -1,6 +1,6 @@
 # PyTorch DINOv3
 
-A PyTorch implementation of **DINOv3** (Meta's self-supervised ViT models) with a DETR object-detection head. The backbone is vendored from Meta's [official DINOv3 repository](https://github.com/facebookresearch/dinov3).
+A PyTorch implementation of **DINOv3** (Meta's self-supervised ViT models) with DETR object-detection and DINOv3+MiniCPM VQA heads. The backbone is vendored from Meta's [official DINOv3 repository](https://github.com/facebookresearch/dinov3).
 
 Supports CUDA, Apple Silicon (MPS), and CPU with automatic device detection.
 
@@ -11,6 +11,7 @@ Supports CUDA, Apple Silicon (MPS), and CPU with automatic device detection.
 - **Multiple Architectures**: `vit_small`, `vit_base`, `vit_large`, `vit_so400m`, `vit_huge2`, `vit_giant2`, `vit_7b`.
 - **Advanced Components**: RoPE, SwiGLU FFN, LayerScale, storage/register tokens.
 - **DETR Detection Head**: Trainable deformable-attention decoder on COCO using frozen DINOv3 patch tokens.
+- **VQA Head**: DINOv3 + MiniCPM5-1B hybrid (LoRA + vision adapter) for GhanaAgricVQA crop-disease question answering.
 
 ## Installation
 
@@ -21,7 +22,7 @@ pip install -e .
 Or install dependencies directly:
 
 ```bash
-pip install torch transformers matplotlib numpy pillow scipy pycocotools tqdm pyyaml safetensors
+pip install torch transformers matplotlib numpy pillow scipy pycocotools tqdm pyyaml safetensors datasets nltk peft accelerate
 ```
 
 ## Usage
@@ -66,12 +67,25 @@ python heads/detr/train.py
 python heads/detr/inference.py
 ```
 
+### 5. VQA Training (DINOv3 + MiniCPM5-1B)
+
+```bash
+python -m heads.vqa.train --epochs 5 --batch-size 4
+```
+
+### 6. VQA Inference
+
+```bash
+python -m heads.vqa.inference
+```
+
 ## Repository Structure
 
 - `dinov3/models/`: Core ViT architecture (vendored from Meta).
 - `dinov3/layers/`: RoPE, SwiGLU, Attention, etc. (vendored from Meta).
 - `dinov3/checkpoints/`: Checkpoint loading utilities.
 - `heads/detr/`: DETR detection head, training, and inference.
+- `heads/vqa/`: DINOv3 + MiniCPM5-1B hybrid VQA head for GhanaAgricVQA.
 
 ## Acknowledgments
 
