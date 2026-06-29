@@ -100,6 +100,7 @@ class LossStats:
     cls: float
     bbox_l1: float
     bbox_giou: float
+    severity: float
     num_matched: int
 
 
@@ -107,22 +108,26 @@ class HungarianLoss(nn.Module):
     def __init__(
         self,
         num_classes: int,
+        num_severity_classes: int = 4,
         cost_class: float = 1.0,
         cost_bbox: float = 5.0,
         cost_giou: float = 2.0,
         loss_class: float = 1.0,
         loss_bbox: float = 5.0,
         loss_giou: float = 2.0,
+        loss_severity: float = 1.0,
         no_obj_coef: float = 0.1,
     ):
         super().__init__()
         self.num_classes = num_classes
+        self.num_severity_classes = num_severity_classes
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
         self.loss_class = loss_class
         self.loss_bbox = loss_bbox
         self.loss_giou = loss_giou
+        self.loss_severity = loss_severity
         self.no_obj_coef = no_obj_coef
 
     def _cls_loss(
@@ -170,6 +175,31 @@ class HungarianLoss(nn.Module):
 
         return l1, giou
 
+    def _severity_loss(
+        self,
+        pred_severity_logits: torch.Tensor,
+        gt_severities: torch.Tensor,
+        query_idx: np.ndarray,
+        gt_idx: np.ndarray,
+    ) -> torch.Tensor:
+        num_queries = pred_severity_logits.shape[0]
+        bg_idx = self.num_severity_classes
+        targets = np.full((num_queries,), bg_idx, dtype=np.int32)
+        if len(query_idx) > 0:
+            targets[query_idx] = (
+                gt_severities.detach().cpu().numpy().astype(np.int32)[gt_idx]
+            )
+
+        targets_t = torch.tensor(targets, device=pred_severity_logits.device, dtype=torch.long)
+
+        weights = torch.ones(self.num_severity_classes + 1, device=pred_severity_logits.device)
+        weights[self.num_severity_classes] = self.no_obj_coef
+
+        log_probs = F.log_softmax(pred_severity_logits, dim=-1)
+        nll = -log_probs.gather(1, targets_t.unsqueeze(1)).squeeze(1)
+        sample_weights = weights[targets_t]
+        return (nll * sample_weights).mean()
+
     def _single_pass(
         self,
         predictions: Dict[str, torch.Tensor],
@@ -177,11 +207,13 @@ class HungarianLoss(nn.Module):
     ) -> Tuple[torch.Tensor, List[LossStats]]:
         pred_logits = predictions["logits"]
         pred_boxes = predictions["boxes"]
+        pred_severity_logits = predictions.get("severity_logits")
         batch_size = pred_logits.shape[0]
 
         total_cls = torch.tensor(0.0, device=pred_logits.device)
         total_l1 = torch.tensor(0.0, device=pred_logits.device)
         total_giou = torch.tensor(0.0, device=pred_logits.device)
+        total_severity = torch.tensor(0.0, device=pred_logits.device)
         stats: List[LossStats] = []
 
         for i in range(batch_size):
@@ -192,12 +224,18 @@ class HungarianLoss(nn.Module):
                     idx = torch.tensor(valid_idx, device=pred_logits.device)
                     gt_labels = targets["labels"][i][idx]
                     gt_boxes = targets["boxes"][i][idx]
+                    gt_severities = targets["severities"][i][idx]
                 else:
                     gt_labels = torch.tensor([], device=pred_logits.device, dtype=torch.long)
                     gt_boxes = torch.zeros((0, 4), device=pred_logits.device)
+                    gt_severities = torch.tensor([], device=pred_logits.device, dtype=torch.long)
             else:
                 gt_labels = targets[i]["labels"]
                 gt_boxes = targets[i]["boxes"]
+                gt_severities = targets[i].get(
+                    "severities",
+                    torch.zeros_like(gt_labels),
+                )
 
             q_idx, g_idx = hungarian_match(
                 pred_logits[i],
@@ -212,9 +250,17 @@ class HungarianLoss(nn.Module):
             cls_l = self._cls_loss(pred_logits[i], gt_labels, q_idx, g_idx)
             l1_l, giou_l = self._box_losses(pred_boxes[i], gt_boxes, q_idx, g_idx)
 
+            if pred_severity_logits is not None:
+                sev_l = self._severity_loss(
+                    pred_severity_logits[i], gt_severities, q_idx, g_idx
+                )
+            else:
+                sev_l = torch.tensor(0.0, device=pred_logits.device)
+
             total_cls = total_cls + cls_l
             total_l1 = total_l1 + l1_l
             total_giou = total_giou + giou_l
+            total_severity = total_severity + sev_l
 
             stats.append(
                 LossStats(
@@ -222,6 +268,7 @@ class HungarianLoss(nn.Module):
                     cls=float(cls_l.item()),
                     bbox_l1=float(l1_l.item()),
                     bbox_giou=float(giou_l.item()),
+                    severity=float(sev_l.item()),
                     num_matched=len(q_idx),
                 )
             )
@@ -230,6 +277,7 @@ class HungarianLoss(nn.Module):
             self.loss_class * total_cls / batch_size
             + self.loss_bbox * total_l1 / batch_size
             + self.loss_giou * total_giou / batch_size
+            + self.loss_severity * total_severity / batch_size
         )
         return loss, stats
 

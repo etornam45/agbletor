@@ -1,3 +1,5 @@
+from typing import Dict, List, Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,107 +10,47 @@ import matplotlib.patches as patches
 from dinov3.checkpoints.load import load_checkpoint
 from dinov3.models import vit_small
 from dinov3.utils.device import get_device
-from heads.detr.dataset import letterbox
+from heads.detr.dataset import (
+    ID_TO_DISEASE_LABEL,
+    ID_TO_SEVERITY_LABEL,
+    NUM_DISEASE_CLASSES,
+    NUM_SEVERITY_CLASSES,
+    letterbox,
+    load_ghana_agric_detections,
+)
 from heads.detr.transformer import build_detr
 
-COCO_CLASSES = [
-    "N/A",
-    "person",
-    "bicycle",
-    "car",
-    "motorcycle",
-    "airplane",
-    "bus",
-    "train",
-    "truck",
-    "boat",
-    "traffic light",
-    "fire hydrant",
-    "N/A",
-    "stop sign",
-    "parking meter",
-    "bench",
-    "bird",
-    "cat",
-    "dog",
-    "horse",
-    "sheep",
-    "cow",
-    "elephant",
-    "bear",
-    "zebra",
-    "giraffe",
-    "N/A",
-    "backpack",
-    "umbrella",
-    "N/A",
-    "N/A",
-    "handbag",
-    "tie",
-    "suitcase",
-    "frisbee",
-    "skis",
-    "snowboard",
-    "sports ball",
-    "kite",
-    "baseball bat",
-    "baseball glove",
-    "skateboard",
-    "surfboard",
-    "tennis racket",
-    "bottle",
-    "N/A",
-    "wine glass",
-    "cup",
-    "fork",
-    "knife",
-    "spoon",
-    "bowl",
-    "banana",
-    "apple",
-    "sandwich",
-    "orange",
-    "broccoli",
-    "carrot",
-    "hot dog",
-    "pizza",
-    "donut",
-    "cake",
-    "chair",
-    "couch",
-    "potted plant",
-    "bed",
-    "N/A",
-    "dining table",
-    "N/A",
-    "N/A",
-    "toilet",
-    "N/A",
-    "tv",
-    "laptop",
-    "mouse",
-    "remote",
-    "keyboard",
-    "cell phone",
-    "microwave",
-    "oven",
-    "toaster",
-    "sink",
-    "refrigerator",
-    "N/A",
-    "book",
-    "clock",
-    "vase",
-    "scissors",
-    "teddy bear",
-    "hair drier",
-    "toothbrush",
-]
+IMG_SIZE = 224
+N_CLASSES = NUM_DISEASE_CLASSES + 1
+N_SEVERITY_CLASSES = NUM_SEVERITY_CLASSES + 1
+CHECKPOINT_PATH = "dinov3/checkpoints/model/detr_ghana_decoder.pt"
 
 
-def run_inference(image_path="test/test5.jpeg", threshold=0.62):
-    device = get_device()
+def cxcywh_norm_to_xyxy_orig(
+    boxes: np.ndarray,
+    scale: float,
+    pad_x: int,
+    pad_y: int,
+    target_size: int,
+) -> np.ndarray:
+    cx = boxes[:, 0] * target_size
+    cy = boxes[:, 1] * target_size
+    w = boxes[:, 2] * target_size
+    h = boxes[:, 3] * target_size
 
+    x1 = cx - w / 2
+    y1 = cy - h / 2
+    x2 = cx + w / 2
+    y2 = cy + h / 2
+
+    x1 = (x1 - pad_x) / scale
+    y1 = (y1 - pad_y) / scale
+    x2 = (x2 - pad_x) / scale
+    y2 = (y2 - pad_y) / scale
+    return np.stack([x1, y1, x2, y2], axis=-1)
+
+
+def load_model(device: torch.device):
     dinov3_small = vit_small(
         patch_size=16,
         n_storage_tokens=4,
@@ -124,22 +66,38 @@ def run_inference(image_path="test/test5.jpeg", threshold=0.62):
 
     detr_decoder = build_detr(
         d_model=384,
-        num_layers=3,
-        n_classes=92,
-        n_points=4,
+        num_layers=4,
+        n_classes=N_CLASSES,
+        n_severity_classes=N_SEVERITY_CLASSES,
+        n_points=5,
     ).to(device)
     detr_decoder.load_state_dict(
-        torch.load(
-            "dinov3/checkpoints/model/detr_decoder.pt",
-            map_location=device,
-            weights_only=True,
-        )
+        torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
     )
     detr_decoder.eval()
+    return dinov3_small, detr_decoder
 
-    img_pil = Image.open(image_path).convert("RGB")
-    img_pil, _, _, _ = letterbox(img_pil, 224)
-    img_arr = np.array(img_pil, dtype=np.float32) / 255.0
+
+def run_inference(
+    image_path: Optional[str] = None,
+    threshold: float = 0.5,
+) -> Dict[str, List[dict]]:
+    device = get_device()
+    dinov3_small, detr_decoder = load_model(device)
+
+    if image_path is None:
+        hf_dataset, samples = load_ghana_agric_detections(split="test", img_size=IMG_SIZE)
+        row = hf_dataset[samples[0]["hf_idx"]]
+        img_pil = row["image"]
+        if not isinstance(img_pil, Image.Image):
+            img_pil = Image.open(img_pil).convert("RGB")
+        else:
+            img_pil = img_pil.convert("RGB")
+    else:
+        img_pil = Image.open(image_path).convert("RGB")
+
+    img_pil_lb, scale, pad_x, pad_y = letterbox(img_pil, IMG_SIZE)
+    img_arr = np.array(img_pil_lb, dtype=np.float32) / 255.0
     image = torch.from_numpy(img_arr).permute(2, 0, 1).unsqueeze(0).to(device)
 
     with torch.no_grad():
@@ -149,47 +107,79 @@ def run_inference(image_path="test/test5.jpeg", threshold=0.62):
 
     logits = output["logits"][0]
     boxes = output["boxes"][0]
+    severity_logits = output["severity_logits"][0]
 
     probs = F.softmax(logits, dim=-1)
-    scores, labels = probs[:, :-1].max(dim=-1)
+    scores, label_idx = probs[:, 1:-1].max(dim=-1)
+    labels = label_idx + 1
+
+    sev_probs = F.softmax(severity_logits, dim=-1)
+    sev_scores, sev_idx = sev_probs[:, 1:-1].max(dim=-1)
+    severities = sev_idx + 1
 
     keep = scores > threshold
-    scores = scores[keep].cpu().numpy()
-    labels = labels[keep].cpu().numpy()
-    boxes = boxes[keep].cpu().numpy()
+    scores_np = scores[keep].cpu().numpy()
+    labels_np = labels[keep].cpu().numpy()
+    boxes_np = boxes[keep].cpu().numpy()
+    severities_np = severities[keep].cpu().numpy()
+    sev_scores_np = sev_scores[keep].cpu().numpy()
 
-    img_size = 224
+    boxes_xyxy = cxcywh_norm_to_xyxy_orig(
+        boxes_np, scale, pad_x, pad_y, IMG_SIZE
+    )
+
+    detections = []
+    for score, label, sev_score, severity, bbox in zip(
+        scores_np, labels_np, sev_scores_np, severities_np, boxes_xyxy
+    ):
+        detections.append(
+            {
+                "bbox": [float(b) for b in bbox],
+                "disease_label": ID_TO_DISEASE_LABEL.get(int(label), "unknown"),
+                "severity": ID_TO_SEVERITY_LABEL.get(int(severity), "none"),
+                "score": float(score),
+                "severity_score": float(sev_score),
+            }
+        )
+
     fig, ax = plt.subplots(1, figsize=(8, 8))
     ax.imshow(img_arr)
 
-    for score, label, (cx, cy, w, h) in zip(scores, labels, boxes):
-        x = (cx - w / 2) * img_size
-        y = (cy - h / 2) * img_size
-        pw = w * img_size
-        ph = h * img_size
-
+    for det in detections:
+        x1_lb = det["bbox"][0] * scale + pad_x
+        y1_lb = det["bbox"][1] * scale + pad_y
+        x2_lb = det["bbox"][2] * scale + pad_x
+        y2_lb = det["bbox"][3] * scale + pad_y
         rect = patches.Rectangle(
-            (x, y), pw, ph, linewidth=2, edgecolor="red", facecolor="none", alpha=0.9
+            (x1_lb, y1_lb),
+            x2_lb - x1_lb,
+            y2_lb - y1_lb,
+            linewidth=2,
+            edgecolor="red",
+            facecolor="none",
+            alpha=0.9,
         )
         ax.add_patch(rect)
-
-        class_name = (
-            COCO_CLASSES[label] if label < len(COCO_CLASSES) else f"Class {label}"
-        )
         ax.text(
-            x,
-            y,
-            f"{class_name}: {score:.2f}",
+            x1_lb,
+            y1_lb,
+            f"{det['disease_label']} ({det['severity']}): {det['score']:.2f}",
             bbox=dict(facecolor="red", alpha=0.5),
             fontsize=8,
             color="white",
         )
 
     plt.axis("off")
-    plt.title(f"DETR Predictions (threshold={threshold})")
+    plt.title(f"DETR Ghana Agric Predictions (threshold={threshold})")
     plt.savefig("detr_output.png")
     print("Results saved to detr_output.png")
 
+    return {"detections": detections}
+
 
 if __name__ == "__main__":
-    run_inference()
+    import sys
+
+    path = sys.argv[1] if len(sys.argv) > 1 else None
+    result = run_inference(image_path=path)
+    print(result)

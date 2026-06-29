@@ -54,6 +54,7 @@ class DETR(nn.Module):
         num_layers=6,
         dim_ff=1024,
         n_classes=20,
+        n_severity_classes=5,
         n_queries=50,
         dropout=0.1,
         img_size=224,
@@ -67,6 +68,9 @@ class DETR(nn.Module):
         )
         self.bbox_pred = FFN(d_model, d_model, 4, n_layers=2, dropout=dropout)
         self.class_pred = FFN(d_model, d_model, n_classes, n_layers=2, dropout=dropout)
+        self.severity_pred = FFN(
+            d_model, d_model, n_severity_classes, n_layers=2, dropout=dropout
+        )
 
         h = w = img_size // patch_size
         self.register_buffer("_pos", build_2d_sincos_pos_embed(h, w, d_model))
@@ -88,12 +92,14 @@ class DETR(nn.Module):
         out = {
             "logits": self.class_pred(final_hs),
             "boxes": torch.sigmoid(self.bbox_pred(final_hs)),
+            "severity_logits": self.severity_pred(final_hs),
         }
 
         out["aux"] = [
             {
                 "logits": self.class_pred(hs),
                 "boxes": torch.sigmoid(self.bbox_pred(hs)),
+                "severity_logits": self.severity_pred(hs),
             }
             for hs in all_hs[:-1]
         ]
@@ -107,6 +113,7 @@ def build_detr(
     num_layers: int = 6,
     dim_ff: int = 1024,
     n_classes: int = 20,
+    n_severity_classes: int = 5,
     n_queries: int = 100,
     n_points: int = 4,
     dropout: float = 0.1,
@@ -117,6 +124,7 @@ def build_detr(
         num_layers=num_layers,
         dim_ff=dim_ff,
         n_classes=n_classes,
+        n_severity_classes=n_severity_classes,
         n_queries=n_queries,
         dropout=dropout,
         n_points=n_points,
