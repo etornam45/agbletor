@@ -1,4 +1,4 @@
-from pathlib import Path
+import argparse
 from typing import Optional
 
 import numpy as np
@@ -7,12 +7,13 @@ from PIL import Image
 
 from dinov3.utils.device import get_device
 from heads.detr.dataset import letterbox
-from heads.vqa.dataset import DATASET_NAME, encode_user_prompt, normalize_answer
+from heads.vqa.dataset import encode_user_prompt, normalize_answer
 from heads.vqa.model import (
     DEFAULT_CHECKPOINT_DIR,
     build_hybrid_model,
     decode_generated_answer,
     load_hybrid_checkpoint,
+    resolve_checkpoint_dir,
 )
 
 IMG_SIZE = 224
@@ -31,15 +32,8 @@ def run_inference(
     checkpoint_dir: str = DEFAULT_CHECKPOINT_DIR,
 ) -> str:
     device = get_device()
-
-    checkpoint_path = Path(checkpoint_dir)
-    best_path = checkpoint_path.parent / f"{checkpoint_path.name}_best"
-    if not checkpoint_path.exists() and best_path.exists():
-        checkpoint_path = best_path
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(
-            f"No checkpoint at {checkpoint_dir}. Run python -m heads.vqa.train first."
-        )
+    checkpoint_path = resolve_checkpoint_dir(checkpoint_dir)
+    print(f"Loading checkpoint: {checkpoint_path}")
 
     model, tokenizer = build_hybrid_model(device)
     load_hybrid_checkpoint(model, str(checkpoint_path), device, trainable_adapter=False)
@@ -78,13 +72,30 @@ def run_inference(
     return answer
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run DINOv3 + MiniCPM VQA inference")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=DEFAULT_CHECKPOINT_DIR,
+        help="Checkpoint directory (uses *_best if present)",
+    )
+    parser.add_argument("--image", type=str, default=None, help="Path to input image")
+    parser.add_argument("--question", type=str, default=None, help="Question about the image")
+    parser.add_argument("--max-new-tokens", type=int, default=128)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    checkpoint = Path(DEFAULT_CHECKPOINT_DIR)
-    best = checkpoint.parent / f"{checkpoint.name}_best"
-    if not checkpoint.exists() and not best.exists():
-        print(
-            f"Checkpoint not found at {DEFAULT_CHECKPOINT_DIR}. "
-            "Run python -m heads.vqa.train first."
-        )
+    args = parse_args()
+    try:
+        resolve_checkpoint_dir(args.checkpoint)
+    except FileNotFoundError as exc:
+        print(exc)
     else:
-        run_inference()
+        run_inference(
+            image_path=args.image,
+            question=args.question,
+            max_new_tokens=args.max_new_tokens,
+            checkpoint_dir=args.checkpoint,
+        )

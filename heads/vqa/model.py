@@ -255,13 +255,27 @@ def save_hybrid_checkpoint(model: DINOv3MiniCPMHybrid, checkpoint_dir: str) -> N
     )
 
 
+def resolve_checkpoint_dir(checkpoint_dir: str = DEFAULT_CHECKPOINT_DIR) -> Path:
+    path = Path(checkpoint_dir)
+    best_path = path.parent / f"{path.name}_best"
+    if best_path.exists():
+        return best_path
+    if path.exists():
+        return path
+    raise FileNotFoundError(
+        f"No checkpoint at {checkpoint_dir} or {best_path}. "
+        "Run python -m heads.vqa.train first."
+    )
+
+
 def load_hybrid_checkpoint(
     model: DINOv3MiniCPMHybrid,
     checkpoint_dir: str,
     device: torch.device,
     trainable_adapter: bool = False,
 ) -> None:
-    from peft import PeftModel
+    from peft import PeftModel, load_peft_weights
+    from peft.utils import set_peft_model_state_dict
 
     path = Path(checkpoint_dir)
     adapter_dir = path / "adapter"
@@ -269,14 +283,20 @@ def load_hybrid_checkpoint(
 
     if adapter_dir.exists():
         if isinstance(model.llm, PeftModel):
-            base_model = model.llm.get_base_model()
+            adapter_weights = load_peft_weights(str(adapter_dir))
+            set_peft_model_state_dict(model.llm, adapter_weights)
+            if trainable_adapter:
+                for param in model.llm.parameters():
+                    param.requires_grad_(False)
+                for name, param in model.llm.named_parameters():
+                    if "lora_" in name:
+                        param.requires_grad_(True)
         else:
-            base_model = model.llm
-        model.llm = PeftModel.from_pretrained(
-            base_model,
-            str(adapter_dir),
-            is_trainable=trainable_adapter,
-        ).to(device)
+            model.llm = PeftModel.from_pretrained(
+                model.llm,
+                str(adapter_dir),
+                is_trainable=trainable_adapter,
+            ).to(device)
 
     if vision_path.exists():
         state = torch.load(vision_path, map_location=device, weights_only=True)
