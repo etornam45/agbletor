@@ -3,7 +3,6 @@ from typing import Optional
 
 import numpy as np
 import torch
-from datasets import load_dataset
 from PIL import Image
 
 from dinov3.utils.device import get_device
@@ -47,7 +46,9 @@ def run_inference(
     model.eval()
 
     if image_path is None:
-        sample = load_dataset(DATASET_NAME, split="test")[0]
+        from heads.vqa.dataset import load_ghana_agric_split
+
+        sample = load_ghana_agric_split("test")[0]
         image = sample["image"]
         if question is None:
             question = sample["question"]

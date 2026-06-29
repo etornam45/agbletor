@@ -34,7 +34,13 @@ def normalize_answer(answer: Union[str, dict]) -> str:
 def load_ghana_agric_split(split: str = "train", language: str = "en"):
     dataset = load_dataset(DATASET_NAME, split=split)
     if language:
-        dataset = dataset.filter(lambda x: x.get("language", "en") == language)
+        langs = dataset["language"]
+        indices = [
+            i
+            for i, lang in enumerate(langs)
+            if (lang if lang is not None else "en") == language
+        ]
+        dataset = dataset.select(indices)
     return dataset
 
 

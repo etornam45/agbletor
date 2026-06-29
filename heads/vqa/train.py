@@ -130,15 +130,7 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
     )
-    test_loader, _ = make_dataloader(
-        tokenizer,
-        split="test",
-        max_length=args.max_length,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-    )
-    print(f"Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
+    print(f"Train batches: {len(train_loader)}")
 
     optimizer = optim.AdamW(
         [
@@ -161,7 +153,17 @@ def main():
 
     for epoch in range(args.epochs):
         train_loss = train_epoch(model, train_loader, optimizer, device)
+
+        test_loader, _ = make_dataloader(
+            tokenizer,
+            split="test",
+            max_length=args.max_length,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
         eval_loss, refs, hyps = evaluate(model, test_loader, tokenizer, device)
+        del test_loader
 
         print(
             f"Epoch {epoch + 1}/{args.epochs}: "
